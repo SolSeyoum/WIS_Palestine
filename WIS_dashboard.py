@@ -1,40 +1,32 @@
 """
-dashboard.py
-=============
+WIS_dashboard.py
+================
 Climate-Water Balance and Hydrological Stress Dashboard.
 
-Lets the user work at either River Basin or Administrative Unit level. All
-data is read automatically from a fixed folder layout on disk (see below).
-Computes water availability indicators (CWB,
-AI, ESI, SPEI and TWSA), and displays them via a
-status-card summary, trend charts, a choropleth spatial map, a monthly
-anomaly heatmap, and data export.
+Work at River Basin or Administrative Unit level. Data is read from a fixed
+folder layout, indicators (CWB, AI, ESI, SPEI, TWSA) are computed in
+`water_indicators.py`, and shown as status cards, trend charts, a choropleth
+map, anomaly heatmaps and exports.
 
 Expected data folder layout
-----------------------------
-    data/river_basins/boundary/*.shp   (or .geojson / .zip)
-    data/river_basins/monthly/<unit name>.csv
-    data/river_basins/annual.csv
+---------------------------
+    data/river_basins/boundary/*.shp   (or .geojson / .json / .zip)
+    data/river_basins/monthly/<unit name>.csv      columns: time;PCP;AETI;RET;TWS
+    data/river_basins/annual.csv                   columns: year;River_basins;PCP;AETI;RET;TWS;area_sq_km
 
-    data/admin_units/boundary/*.shp    (or .geojson / .zip)
+    data/admin_units/boundary/*.shp
     data/admin_units/monthly/<unit name>.csv
     data/admin_units/annual.csv
 
-- `boundary/` is scanned for the first usable boundary file, in this order
-  of preference: .shp, .geojson/.json, .zip (a zipped shapefile/geojson).
-  The unit-name column is expected to be `BASIN_NAME` for River Basins and
-  `Admin_level1` for Administrative Units.
-- `monthly/` holds one CSV per unit (columns: time;PCP;AETI;RET;TWS); the
-  unit name is taken from the filename.
-- `annual.csv` holds one row per unit/year (columns:
-  year;River_basins;PCP;AETI;RET;TWS;area_sq_km).
+Boundary unit-name column: `BASIN_NAME` (River Basins), `Admin_level1`
+(Administrative Units).
 
 Run:
-    streamlit run dashboard.py
+    streamlit run WIS_dashboard.py
 """
 
 import io
-import json
+import math
 import os
 import tempfile
 import zipfile
@@ -53,15 +45,19 @@ except ImportError:  # pragma: no cover
     _HAS_GEO = False
 
 from water_indicators import (
+    METHOD_PACKAGE,
     IndicatorConfig,
-    classify_spei,
     compute_all_indicators,
     latest_snapshot,
+    period_average_snapshot,
 )
 
 # --------------------------------------------------------------------------
-# Page setup
+# Configuration
 # --------------------------------------------------------------------------
+
+REGION_NAME = "Palestine"
+DATA_SOURCE = "WaPOR data"
 
 st.set_page_config(
     page_title="Climate-Water Balance & Hydrological Stress Dashboard",
@@ -69,6 +65,21 @@ st.set_page_config(
     layout="wide",
 )
 
+
+def _version_tuple(v: str):
+    out = []
+    for part in v.split(".")[:2]:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+# Streamlit replaced `use_container_width=True` with `width="stretch"`.
+STRETCH = (
+    {"width": "stretch"}
+    if _version_tuple(st.__version__) >= (1, 50)
+    else {"use_container_width": True}
+)
 
 STATUS_COLORS = {
     "Extremely Wet": "#08519c",
@@ -90,23 +101,31 @@ ARIDITY_COLORS = {
     "No Data": "#bdbdbd",
 }
 
-# Standardized indices (SPEI, TWSA, ESI) are all z-score-like and
-# are consistently displayed on a fixed -3..3 axis / color range so that
-# magnitudes are comparable across charts, units and the map.
+# Standardized indices are shown on a fixed -3..3 range for comparability.
 STD_INDEX_RANGE = (-3, 3)
 
-# BrBG ("Brown-Blue-Green") is the standard diverging colormap for
-# hydrological/drought anomalies: brown = dry / water deficit, teal-blue =
-# wet / water surplus, with a neutral tan-white at zero. This reads far
-# more intuitively for a water-balance audience than a generic red-blue
-# temperature-style scale.
+# BrBG: brown = dry / deficit, teal-blue = wet / surplus.
 WATER_COLORSCALE = "BrBG"
 
-# Fixed unit-name column expected in the boundary file, per spatial unit.
 BOUNDARY_ID_COLUMN = {
     "River Basins": "BASIN_NAME",
     "Administrative Units": "Admin_level1",
 }
+
+# Wet/dry bands for SPEI and TWSA (positive = wetter).
+SPEI_ZONES = [
+    (-3, -2, "#B2182B"),
+    (-2, -1.5, "#EF8A62"),
+    (-1.5, -1, "#FDCC8A"),
+    (-1, 1, "#E0E0E0"),
+    (1, 1.5, "#B3CDE3"),
+    (1.5, 2, "#67A9CF"),
+    (2, 3, "#2166AC"),
+]
+# ESI is the opposite: positive = more stress, so mirror the bands and the
+# brown (dry/stressed) colours sit at the high end.
+ESI_ZONES = [(-y1, -y0, color) for y0, y1, color in SPEI_ZONES]
+BAND_OPACITY = 0.35
 
 
 def status_badge(label: str) -> str:
@@ -117,18 +136,34 @@ def status_badge(label: str) -> str:
     )
 
 
+def add_bands(fig, zones):
+    for y0, y1, color in zones:
+        fig.add_hrect(y0=y0, y1=y1, fillcolor=color, opacity=BAND_OPACITY, line_width=0)
+
+
 # --------------------------------------------------------------------------
-# Data loading helpers
+# Data loading (cached; keyed on file signatures so edits invalidate caches)
 # --------------------------------------------------------------------------
+
+
+def folder_signature(path: str):
+    """Cheap fingerprint (name, size, mtime) of a file or folder's files."""
+    if os.path.isfile(path):
+        st_ = os.stat(path)
+        return ((os.path.basename(path), st_.st_size, st_.st_mtime_ns),)
+    if not os.path.isdir(path):
+        return ()
+    sig = []
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            st_ = os.stat(full)
+            sig.append((name, st_.st_size, st_.st_mtime_ns))
+    return tuple(sig)
 
 
 def find_boundary_file(folder: str):
-    """Scan `folder` for a usable boundary file and return its path, or
-    None if the folder doesn't exist or has nothing usable.
-
-    Preference order when several are present: .shp, then .geojson/.json,
-    then .zip (a zipped shapefile/geojson).
-    """
+    """First usable boundary file: .shp, then .geojson/.json, then .zip."""
     if not folder or not os.path.isdir(folder):
         return None
     try:
@@ -143,37 +178,59 @@ def find_boundary_file(folder: str):
 
 
 def load_boundary_from_path(path: str):
-    """Load a boundary file on disk — .shp, .geojson/.json, or a .zip
-    containing either — with geopandas, reprojecting to EPSG:4326."""
+    """Load .shp / .geojson / .json / .zip with geopandas, in EPSG:4326."""
     if path.lower().endswith(".zip"):
         with tempfile.TemporaryDirectory() as tmpdir:
             with zipfile.ZipFile(path) as zf:
                 zf.extractall(tmpdir)
-            shp_files = [f for f in os.listdir(tmpdir) if f.lower().endswith(".shp")]
-            geo_files = [
-                f
-                for f in os.listdir(tmpdir)
-                if f.lower().endswith((".geojson", ".json"))
-            ]
-            if shp_files:
-                gdf = gpd.read_file(os.path.join(tmpdir, shp_files[0]))
-            elif geo_files:
-                gdf = gpd.read_file(os.path.join(tmpdir, geo_files[0]))
+            found = []
+            for root, _dirs, files in os.walk(tmpdir):
+                found += [os.path.join(root, f) for f in files]
+            shp = [f for f in found if f.lower().endswith(".shp")]
+            geo = [f for f in found if f.lower().endswith((".geojson", ".json"))]
+            if shp:
+                gdf = gpd.read_file(shp[0])
+            elif geo:
+                gdf = gpd.read_file(geo[0])
             else:
                 raise ValueError(f"No .shp or .geojson file found inside {path}.")
     else:
         gdf = gpd.read_file(path)
-    if gdf.crs is not None and str(gdf.crs).upper() not in ("EPSG:4326",):
+    if gdf.crs is not None and str(gdf.crs).upper() != "EPSG:4326":
         gdf = gdf.to_crs("EPSG:4326")
     return gdf
 
 
+@st.cache_data(show_spinner="Reading boundary file…")
+def load_boundary(path: str, signature, id_col: str):
+    """Returns (slim_gdf[unit, geometry], geojson dict, bounds, error)."""
+    try:
+        gdf = load_boundary_from_path(path)
+    except Exception as e:
+        return None, None, None, f"Could not read boundary file `{path}`: {e}"
+    if id_col not in gdf.columns:
+        cols = ", ".join(gdf.columns.drop("geometry").tolist())
+        return (
+            None,
+            None,
+            None,
+            f"Boundary file `{os.path.basename(path)}` has no `{id_col}` column (found: {cols}).",
+        )
+    slim = gdf[[id_col, "geometry"]].rename(columns={id_col: "unit"})
+    slim["unit"] = slim["unit"].astype(str).str.strip()
+    slim = slim.reset_index(drop=True)
+    geojson = slim.__geo_interface__
+    # plotly matches on properties.unit
+    for feat in geojson["features"]:
+        feat["properties"] = {"unit": feat["properties"]["unit"]}
+    return slim, geojson, tuple(slim.total_bounds), None
+
+
 def _read_csv_flex_path(path: str) -> pd.DataFrame:
-    """Try ';'-delimited first (as specified for these products), fall back
-    to auto-detected/standard comma CSV."""
+    """Try ';'-delimited first, fall back to a standard comma CSV."""
     try:
         df = pd.read_csv(path, sep=";")
-        if df.shape[1] == 1:  # wrong delimiter guessed
+        if df.shape[1] == 1:
             raise ValueError("single column - wrong delimiter")
     except Exception:
         df = pd.read_csv(path)
@@ -181,44 +238,46 @@ def _read_csv_flex_path(path: str) -> pd.DataFrame:
     return df
 
 
-def read_monthly_csvs_from_folder(folder: str) -> pd.DataFrame:
-    """One CSV per basin/admin unit in `folder`, columns:
-    time;PCP;AETI;RET;TWS. The unit name is taken from the filename
-    (without extension)."""
+_VALUE_ALIASES = {
+    "pcp": "PCP",
+    "ret": "RET",
+    "tws": "TWS",
+    "aeti": "ET",
+    "et": "ET",
+    "aet": "ET",
+}
+
+
+@st.cache_data(show_spinner="Reading monthly CSV files…")
+def read_monthly_csvs(folder: str, signature) -> pd.DataFrame:
+    """One CSV per unit (time;PCP;AETI;RET;TWS); unit = filename."""
     empty = pd.DataFrame(columns=["unit", "date", "PCP", "ET", "RET", "TWS"])
     if not folder or not os.path.isdir(folder):
         return empty
-
     frames = []
     for fname in sorted(os.listdir(folder)):
         if not fname.lower().endswith(".csv"):
             continue
-        unit_name = os.path.splitext(fname)[0]
         df = _read_csv_flex_path(os.path.join(folder, fname))
         rename_map = {}
         for c in df.columns:
             cl = c.lower()
             if cl == "time":
                 rename_map[c] = "date"
-            elif cl in ("aeti", "et", "aet"):
-                rename_map[c] = "ET"
-            elif cl == "pcp":
-                rename_map[c] = "PCP"
-            elif cl == "ret":
-                rename_map[c] = "RET"
-            elif cl == "tws":
-                rename_map[c] = "TWS"
+            elif cl in _VALUE_ALIASES:
+                rename_map[c] = _VALUE_ALIASES[cl]
         df = df.rename(columns=rename_map)
-        df["unit"] = unit_name
+        df["unit"] = os.path.splitext(fname)[0]
         frames.append(df)
     if not frames:
         return empty
-    return pd.concat(frames, ignore_index=True)
+    out = pd.concat(frames, ignore_index=True)
+    out["unit"] = out["unit"].astype(str).str.strip()
+    return out
 
 
-def read_annual_csv_from_path(path: str) -> pd.DataFrame:
-    """Annual CSV for all units, columns:
-    year;River_basins;PCP;AETI;RET;TWS;area_sq_km."""
+@st.cache_data(show_spinner="Reading annual CSV…")
+def read_annual_csv(path: str, signature) -> pd.DataFrame:
     df = _read_csv_flex_path(path)
     rename_map = {}
     for c in df.columns:
@@ -235,23 +294,28 @@ def read_annual_csv_from_path(path: str) -> pd.DataFrame:
             rename_map[c] = "unit"
         elif cl == "year":
             rename_map[c] = "year"
-        elif cl in ("aeti", "et", "aet"):
-            rename_map[c] = "ET"
-        elif cl == "pcp":
-            rename_map[c] = "PCP"
-        elif cl == "ret":
-            rename_map[c] = "RET"
-        elif cl == "tws":
-            rename_map[c] = "TWS"
+        elif cl in _VALUE_ALIASES:
+            rename_map[c] = _VALUE_ALIASES[cl]
         elif cl == "area_sq_km":
             rename_map[c] = "area_sq_km"
     return df.rename(columns=rename_map)
 
 
+@st.cache_data(show_spinner="Computing indicators…")
+def compute_indicators_cached(
+    monthly_dir: str, signature, spei_scale: int
+) -> pd.DataFrame:
+    """Load + compute once per (data on disk, SPEI window). Widget changes
+    that don't touch these inputs (date range, units, map metric…) reuse it."""
+    monthly = read_monthly_csvs(monthly_dir, signature)
+    out = compute_all_indicators(
+        monthly, unit_col="unit", config=IndicatorConfig(spei_scale=spei_scale)
+    )
+    out["date"] = pd.to_datetime(out["date"])
+    return out
+
+
 def ensure_unit_column(df: pd.DataFrame, label: str, fallback_col: str) -> pd.DataFrame:
-    """If a dataframe doesn't already have a 'unit' column, use the fixed
-    `fallback_col` (Admin_level1 / BASIN_NAME depending on spatial unit) —
-    never prompt the user to pick one."""
     if "unit" in df.columns or df.empty:
         return df
     if fallback_col in df.columns:
@@ -263,61 +327,186 @@ def ensure_unit_column(df: pd.DataFrame, label: str, fallback_col: str) -> pd.Da
     return df
 
 
-def _classify_aridity(ai: float) -> str:
-    """UNEP aridity classification from the Aridity Index (PCP / RET)."""
-    if pd.isna(ai):
-        return "No Data"
-    if ai >= 0.65:
-        return "Humid"
-    elif ai >= 0.5:
-        return "Dry Sub-Humid"
-    elif ai >= 0.2:
-        return "Semi-Arid"
-    elif ai >= 0.05:
-        return "Arid"
+def zoom_from_bounds(bounds, map_width_px=1000, map_height_px=600) -> float:
+    """Approximate web-map zoom that fits the boundary extent."""
+    minx, miny, maxx, maxy = bounds
+    lon_span = max(maxx - minx, 1e-4)
+    lat_span = max(maxy - miny, 1e-4)
+    lon_zoom = math.log2(360 * (map_width_px / 512) / lon_span)
+    lat_zoom = math.log2(180 * (map_height_px / 512) / lat_span)
+    return float(min(max(min(lon_zoom, lat_zoom) - 0.3, 0.5), 14))
+
+
+MAP_ENGINES = {
+    "Flat polygons (most compatible)": "flat",
+    "Tile map, no basemap (WebGL)": "white-bg",
+    "Tile map, light basemap (WebGL + internet)": "carto-positron",
+    "Tile map, OpenStreetMap (WebGL + internet)": "open-street-map",
+}
+
+
+def _polygon_rings(geometry):
+    """Yield exterior/interior rings of a GeoJSON Polygon/MultiPolygon as (lons, lats)."""
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+    if gtype == "Polygon":
+        polys = [coords]
+    elif gtype == "MultiPolygon":
+        polys = coords
     else:
-        return "Hyper-Arid"
+        return
+    for poly in polys:
+        for ring in poly:
+            yield [p[0] for p in ring], [p[1] for p in ring]
 
 
-def period_average_snapshot(
-    df: pd.DataFrame, location_col: str = "unit"
-) -> pd.DataFrame:
-    """Average every numeric indicator over the full (already date-filtered)
-    period, per unit, and reclassify SPEI_status / Aridity_class from the
-    averaged SPEI / AI rather than reusing any single month's label."""
-    numeric_cols = [
-        c
-        for c in [
-            "PCP",
-            "ET",
-            "RET",
-            "TWS",
-            "CWB",
-            # "AI",
-            # "ESI",
-            "SPI",
-            "SPEI",
-            "TWSA",
-            # "WAI",
-        ]
-        if c in df.columns
-    ]
-    agg = df.groupby(location_col, as_index=False)[numeric_cols].mean(numeric_only=True)
-    agg["SPEI_status"] = (
-        agg["SPEI"].apply(classify_spei) if "SPEI" in agg.columns else "No Data"
+def flat_choropleth(
+    df,
+    geojson,
+    color,
+    title,
+    color_discrete_map=None,
+    color_continuous_scale=None,
+    range_color=None,
+    hover_data=None,
+    **_ignored,
+):
+    """Choropleth drawn with plain 2-D filled shapes (go.Scatter, fill='toself').
+
+    Uses no WebGL, map tiles or CDN data, so it renders with every Plotly /
+    Streamlit combination (the tile-based map traces need a recent Plotly.js).
+    """
+    from plotly.colors import sample_colorscale
+
+    rows = df.set_index("unit")
+    categorical = color_discrete_map is not None
+    if not categorical:
+        lo, hi = range_color if range_color else (rows[color].min(), rows[color].max())
+        if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+            lo, hi = -1.0, 1.0
+
+    hover_cols = [k for k, v in (hover_data or {}).items() if v is not False]
+    fig = go.Figure()
+    shown = set()
+    lat_all = []
+    for feat in geojson["features"]:
+        unit = feat["properties"]["unit"]
+        value = rows[color].get(unit) if unit in rows.index else None
+        missing = value is None or (not categorical and pd.isna(value))
+        if categorical:
+            label = "No Data" if missing else value
+            fill = color_discrete_map.get(label, "#bdbdbd")
+        else:
+            label = None
+            fill = (
+                "#bdbdbd"
+                if missing
+                else sample_colorscale(
+                    color_continuous_scale, [(float(value) - lo) / (hi - lo)]
+                )[0]
+            )
+        lines = [f"<b>{unit}</b>"]
+        if categorical:
+            lines.append(f"{color}: {label}")
+        else:
+            lines.append(f"{color}: n/a" if missing else f"{color}: {float(value):.2f}")
+        for col in hover_cols:
+            if col in rows.columns and unit in rows.index:
+                v = rows[col].get(unit)
+                if pd.isna(v):
+                    lines.append(f"{col}: n/a")
+                elif isinstance(v, (int, float, np.floating, np.integer)):
+                    lines.append(f"{col}: {v:.2f}")
+                else:
+                    lines.append(f"{col}: {v}")
+        hover = "<br>".join(lines)
+
+        xs, ys = [], []
+        for lons, lats in _polygon_rings(feat["geometry"]):
+            xs += lons + [None]
+            ys += lats + [None]
+            lat_all += lats
+        first = categorical and label not in shown
+        if categorical:
+            shown.add(label)
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                fill="toself",
+                fillcolor=fill,
+                line=dict(color="#555555", width=0.8),
+                text=hover,
+                hoverinfo="text",
+                hoveron="fills",
+                name=str(label) if categorical else unit,
+                legendgroup=str(label) if categorical else None,
+                showlegend=bool(first),
+            )
+        )
+
+    if not categorical:
+        # Invisible marker trace that only provides the colour bar.
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                showlegend=False,
+                hoverinfo="skip",
+                marker=dict(
+                    colorscale=color_continuous_scale,
+                    cmin=lo,
+                    cmax=hi,
+                    color=[lo],
+                    showscale=True,
+                    colorbar=dict(title=color),
+                ),
+            )
+        )
+
+    # Equirectangular correction so shapes are not stretched at this latitude.
+    mid_lat = float(np.mean(lat_all)) if lat_all else 0.0
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(
+        visible=False,
+        scaleanchor="x",
+        scaleratio=1 / max(math.cos(math.radians(mid_lat)), 0.1),
     )
+    fig.update_layout(title=title, height=600, margin=dict(l=0, r=0, t=40, b=0))
+    return fig
 
-    # agg["WAI_status"] = (
-    #     agg["WAI"].apply(classify_wai) if "WAI" in agg.columns else "No Data"
-    # )
-    agg["Aridity_class"] = (
-        agg["AI"].apply(_classify_aridity) if "AI" in agg.columns else "No Data"
+
+def make_choropleth(df, geojson, center, zoom, basemap=None, **kwargs):
+    """Choropleth of `df` over `geojson` using the engine chosen in MAP_ENGINES.
+
+    'Flat polygons' works everywhere. The tile maps need a Plotly.js that knows
+    the `choroplethmap` trace (recent Streamlit); on older ones they render as an
+    empty chart, and online basemaps additionally need internet access.
+    """
+    engine = MAP_ENGINES.get(basemap, "flat")
+    if engine == "flat":
+        return flat_choropleth(df, geojson, **kwargs)
+
+    common = dict(
+        geojson=geojson,
+        locations="unit",
+        featureidkey="properties.unit",
+        hover_name="unit",
+        height=600,
+        center=center,
+        zoom=zoom,
+        opacity=0.85,
+        **kwargs,
     )
-
-    # Keep a 'date' column (period end) purely so downstream code that reads
-    # it for display/export purposes keeps working unchanged.
-    agg["date"] = df["date"].max() if "date" in df.columns and not df.empty else pd.NaT
-    return agg
+    if hasattr(px, "choropleth_map"):
+        fig = px.choropleth_map(df, map_style=engine, **common)
+    else:  # pragma: no cover
+        fig = px.choropleth_mapbox(df, mapbox_style=engine, **common)
+    fig.update_traces(marker_line_width=0.8, marker_line_color="#555555")
+    fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
+    return fig
 
 
 # --------------------------------------------------------------------------
@@ -337,109 +526,69 @@ spatial_unit = st.sidebar.radio(
 )
 unit_label = "basin" if spatial_unit == "River Basins" else "administrative unit"
 
-if spatial_unit == "River Basins":
-    data_path = os.path.join("data", "river_basins")
-else:
-    data_path = os.path.join("data", "admin_units")
-
-data_root = data_path
+data_root = os.path.join(
+    "data", "river_basins" if spatial_unit == "River Basins" else "admin_units"
+)
 boundary_id_col = BOUNDARY_ID_COLUMN[spatial_unit]
-
-# with st.sidebar.container(border=True):
-#     st.markdown("📂 **Expected data folder layout**")
-#     st.caption(
-#         f"`1-{data_root}/boundary/*.shp` (`.geojson` / `.zip`)\n"
-#         f"`2-{data_root}/monthly/<unit name>.csv`\n"
-#         f"`3-{data_root}/annual.csv`"
-#     )
-
-boundary_dir = os.path.join(data_path, "boundary")
-monthly_dir = os.path.join(data_path, "monthly")
-annual_path = os.path.join(data_path, "annual.csv")
+boundary_dir = os.path.join(data_root, "boundary")
+monthly_dir = os.path.join(data_root, "monthly")
+annual_path = os.path.join(data_root, "annual.csv")
 
 # ---- Boundary ----
-gdf = None
+gdf = geojson = bounds = None
 if _HAS_GEO:
     boundary_path = find_boundary_file(boundary_dir)
     if boundary_path is not None:
-        try:
-            gdf = load_boundary_from_path(boundary_path)
-            if boundary_id_col in gdf.columns:
-                gdf = gdf.rename(columns={boundary_id_col: "unit"})
-                gdf["unit"] = gdf["unit"].astype(str).str.strip()
-            else:
-                st.sidebar.error(
-                    f"Boundary file `{os.path.basename(boundary_path)}` has no "
-                    f"`{boundary_id_col}` column (found: "
-                    f"{', '.join(gdf.columns.drop('geometry').tolist())})."
-                )
-                gdf = None
-        except Exception as e:
-            st.sidebar.error(f"Could not read boundary file `{boundary_path}`: {e}")
+        gdf, geojson, bounds, b_err = load_boundary(
+            boundary_path, folder_signature(boundary_dir), boundary_id_col
+        )
+        if b_err:
+            st.sidebar.error(b_err)
     else:
         st.sidebar.info(f"No boundary file found in `{boundary_dir}`.")
 
-# ---- Monthly CSVs ----
-monthly_df = read_monthly_csvs_from_folder(monthly_dir)
-if not monthly_df.empty:
-    monthly_df["unit"] = monthly_df["unit"].astype(str).str.strip()
+# ---- Monthly / annual ----
+monthly_sig = folder_signature(monthly_dir)
+monthly_df = read_monthly_csvs(monthly_dir, monthly_sig)
 
-# ---- Annual CSV ----
 annual_df = None
 if os.path.isfile(annual_path):
-    annual_df = read_annual_csv_from_path(annual_path)
+    annual_df = read_annual_csv(annual_path, folder_signature(annual_path))
     annual_df = ensure_unit_column(
         annual_df, "annual.csv", fallback_col=boundary_id_col
     )
     if "unit" in annual_df.columns:
+        annual_df = annual_df.copy()
         annual_df["unit"] = annual_df["unit"].astype(str).str.strip()
 
-if monthly_df is None or monthly_df.empty:
+if monthly_df.empty:
     st.title("💧 Climate-Water Balance & Hydrological Stress Dashboard")
     st.info(
         f"No monthly data found in `{monthly_dir}`. Select **{spatial_unit}** and place "
-        "data on disk following the folder layout shown in the sidebar, then reload."
+        "data on disk following the folder layout in the README, then reload."
     )
     with st.expander("Column reference"):
         st.markdown(
             f"""
-**Monthly CSV** — one file per basin/admin unit in `{monthly_dir}/`, filename = unit name
+**Monthly CSV** — one file per unit in `{monthly_dir}/`, filename = unit name
 
 | Column | Meaning | Units |
 |---|---|---|
 | `time` | Monthly date | YYYY-MM-DD |
 | `PCP` | Precipitation | mm |
-| `AETI` | Actual evapotranspiration and interception| mm |
+| `AETI` | Actual evapotranspiration and interception | mm |
 | `RET` | Reference evapotranspiration | mm |
-| `TWS` | Total water storage | mm equivalent |
+| `TWS` | Terrestrial water storage | mm equivalent |
 
-**Annual CSV** — single file at `{annual_path}`
+**Annual CSV** — `{annual_path}`: `year`, `River_basins` (unit name), `PCP`, `AETI`, `RET`, `TWS`, `area_sq_km`
 
-| Column | Meaning |
-|---|---|
-| `year` | Calendar year |
-| `River_basins` | Basin / admin-unit name |
-| `PCP`, `AETI`, `RET`, `TWS` | Annual totals / mean |
-| `area_sq_km` | Unit area |
-
-**Boundary file** — auto-detected in `{boundary_dir}/`
-
-A `.shp` (with its `.shx`/`.dbf`/`.prj` siblings), a `.geojson`/`.json`, or a
-`.zip` containing either. The first match found is used. The unit-name
-column must be named **`{boundary_id_col}`** for {spatial_unit}.
+**Boundary file** — auto-detected in `{boundary_dir}/` (.shp, .geojson/.json or .zip).
+The unit-name column must be **`{boundary_id_col}`** for {spatial_unit}.
             """
         )
     st.stop()
 
-# --------------------------------------------------------------------------
-# Sidebar layout — reserve slots up front so the visual order is:
-#   Spatial unit (above) -> Date range -> Status basis ->
-#   Indicator settings (SPEI window) -> Spatial units multiselect
-# Each placeholder is filled further down, once the value it needs
-# (e.g. computed indicators) is available — the fill order doesn't change
-# where it renders, only the order in which we create the placeholders does.
-# --------------------------------------------------------------------------
-
+# Reserve sidebar slots so the visual order stays fixed.
 st.sidebar.markdown("---")
 ph_date_range = st.sidebar.container()
 ph_status_mode = st.sidebar.container()
@@ -447,38 +596,22 @@ ph_indicator_settings = st.sidebar.container()
 ph_units = st.sidebar.container()
 
 # --------------------------------------------------------------------------
-# Indicator settings
+# Indicators
 # --------------------------------------------------------------------------
 
 spei_scale = ph_indicator_settings.slider("SPEI accumulation window (months)", 1, 12, 3)
 
-config = IndicatorConfig(spei_scale=spei_scale)
-
-# --------------------------------------------------------------------------
-# Compute indicators
-# --------------------------------------------------------------------------
-
 try:
-    indicators = compute_all_indicators(monthly_df, unit_col="unit", config=config)
+    indicators = compute_indicators_cached(monthly_dir, monthly_sig, spei_scale)
 except ValueError as e:
     st.error(str(e))
     st.stop()
 
-indicators["date"] = pd.to_datetime(indicators["date"])
+spei_methods = set(indicators["SPEI_method"].dropna().unique())
+spei_fallback_used = bool(spei_methods - {METHOD_PACKAGE})
 
-# Status classification is based on SPEI (climatic water balance,
-# standardized) rather than the composite WAI — reuses the same
-# McKee-et-al. category thresholds via classify_wai, just applied to SPEI.
-indicators["SPEI_status"] = (
-    indicators["SPEI"].apply(classify_spei)
-    if "SPEI" in indicators.columns
-    else "No Data"
-)
-
-# Unit filter — with many basins/admin units, plotting all of them at once
-# turns the trend charts into unreadable spaghetti, so default to a
-# manageable subset. The Spatial Map always shows every unit regardless of
-# this selection (see indicators_all below).
+# Unit filter: default to a readable subset for trend charts. The map always
+# shows every unit.
 all_units = sorted(indicators["unit"].dropna().unique().tolist())
 default_units = all_units[: min(5, len(all_units))]
 if len(all_units) > 15:
@@ -492,7 +625,6 @@ selected_units = ph_units.multiselect(
 if not selected_units:
     ph_units.warning(f"Select at least one {unit_label} to see trend charts.")
 
-# Date range filter (applies to every unit, selected or not — used by the map too)
 min_date, max_date = indicators["date"].min(), indicators["date"].max()
 date_range = ph_date_range.date_input(
     "Date range",
@@ -508,27 +640,20 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
         & (indicators_all["date"] <= pd.Timestamp(end_d))
     ]
 
-# indicators_all -> every unit, date-filtered (drives the map + alerts)
-# indicators     -> only the units picked above, date-filtered (drives Trends/Anomaly)
+# indicators_all -> every unit, date-filtered (map + alerts)
+# indicators     -> selected units, date-filtered (Trends / Anomaly)
 indicators = indicators_all[indicators_all["unit"].isin(selected_units)]
 
 if indicators_all.empty:
     st.warning("No data in the selected date range.")
     st.stop()
 
-# Status basis — applies to the status cards, alerts, the Spatial Map, and
-# the cross-unit comparison chart. "Latest month in period" keeps the old
-# behavior (snapshot at the most recent month within the date range above);
-# "Period average" instead averages every indicator over the whole selected
-# range; "Select a month" lets you pin the status to one specific month
-# within the range, independent of what's latest.
 status_mode = ph_status_mode.radio(
     "Status basis (cards / map / comparisons)",
     ["Latest month in period", "Period average", "Select a month"],
-    help="Controls what 'status' means for the summary cards, the Spatial "
-    "Map, and the cross-unit comparison chart: the most recent month in "
-    "the selected date range, an average over that whole range, or one "
-    "specific month you pick below.",
+    help="What 'status' means for the summary cards, the Spatial Map and the "
+    "cross-unit comparison chart: the most recent month in the selected date "
+    "range, an average over that range, or one specific month you pick.",
 )
 
 selected_month_ts = None
@@ -536,38 +661,39 @@ if status_mode == "Select a month":
     month_choices = sorted(indicators_all["date"].dropna().unique(), reverse=True)
     month_label_map = {pd.Timestamp(d).strftime("%B %Y"): d for d in month_choices}
     selected_month_label = ph_status_mode.selectbox(
-        "Month to display",
-        list(month_label_map.keys()),
-        key="status_month_select",
+        "Month to display", list(month_label_map.keys()), key="status_month_select"
     )
     selected_month_ts = month_label_map[selected_month_label]
 
 # --------------------------------------------------------------------------
-# Header + current status cards
+# Header + status cards
 # --------------------------------------------------------------------------
 
-# st.title("Jordan Climate-Water Balance & Hydrological Stress Dashboard")
-
 st.markdown(
-    """
+    f"""
     <p style="font-size: 2.46rem; font-weight: 700; margin-bottom: 0.2rem;">
-        Palestine Climate-Water Balance & Hydrological Stress Dashboard
+        {REGION_NAME} Climate-Water Balance & Hydrological Stress Dashboard
     </p>
     <p style="font-size: 1.6rem; font-weight: 500; color: #08519c; margin-top: 0;">
-        Uisng WaPOR data
+        Using {DATA_SOURCE}
     </p>
     """,
     unsafe_allow_html=True,
 )
 
 st.caption(
-    f"Spatial unit: **{spatial_unit}**. Indicators: Standardized Precipitation-Evapotranspiration Index (SPEI, simplified), "
-    "Climatic Water Balance (CWB), Evaporative Stress Index (ESI) and Aridity Index (AI)"
+    f"Spatial unit: **{spatial_unit}**. Indicators: Standardized Precipitation-"
+    "Evapotranspiration Index (SPEI), Climatic Water Balance (CWB), Evaporative "
+    "Stress Index (ESI), Terrestrial Water Storage Anomaly (TWSA) and Aridity Index (AI)."
 )
+if spei_fallback_used:
+    st.warning(
+        "SPEI could not be fitted with the log-logistic `spei` package for some or all "
+        "units; a simpler per-calendar-month normal standardization was used instead "
+        f"({', '.join(sorted(spei_methods - {METHOD_PACKAGE}))}). "
+        "Install/upgrade the `spei` package or check for very short or constant records."
+    )
 
-# Status cards reflect the Trends selection (kept compact); alerts and the
-# map below scan *all* units so nothing gets missed just because it wasn't
-# picked for charting.
 period_start, period_end = indicators_all["date"].min(), indicators_all["date"].max()
 if status_mode == "Period average":
     snapshot_all = period_average_snapshot(indicators_all, location_col="unit")
@@ -602,21 +728,14 @@ else:
     for i, (_, row) in enumerate(snapshot.sort_values("unit").iterrows()):
         with cols[i % n_cols]:
             st.markdown(f"**{row['unit']}**")
-            # st.markdown(status_badge(row["WAI_status"]), unsafe_allow_html=True)
             st.markdown(status_badge(row["SPEI_status"]), unsafe_allow_html=True)
-            # st.metric("WAI", f"{row['WAI']:.2f}" if pd.notna(row["WAI"]) else "n/a")
             st.metric("SPEI", f"{row['SPEI']:.2f}" if pd.notna(row["SPEI"]) else "n/a")
-            st.caption(f"CWB {row['CWB']:.0f} mm · Aridity: {row['Aridity_class']}")
+            cwb_txt = f"{row['CWB']:.0f} mm" if pd.notna(row["CWB"]) else "n/a"
+            st.caption(f"CWB {cwb_txt} · Aridity: {row['Aridity_class']}")
 
-# Alerts panel — scans ALL units, not just the ones selected for charting
 alert_rows = snapshot_all[
     snapshot_all["SPEI_status"].isin(["Severely Dry", "Extremely Dry"])
 ]
-
-# alert_rows = snapshot_all[
-#     snapshot_all["SPEI_class"].isin(["Very Dry", "Extremely Dry"])
-# ]
-
 if not alert_rows.empty:
     names = alert_rows["unit"].tolist()
     st.error(
@@ -634,7 +753,7 @@ tab_map, tab_trends, tab_anomaly, tab_data = st.tabs(
     ["🗺️ Spatial Map", "📈 Trends", "🔥 Anomaly Analysis", "📋 Data & Exports"]
 )
 
-# ---- Spatial Map tab ----
+# ---- Spatial Map ----
 with tab_map:
     if not _HAS_GEO:
         st.info("Install `geopandas` and `shapely` to enable the spatial map view.")
@@ -644,123 +763,98 @@ with tab_map:
             f"`{boundary_dir}` (unit-name column `{boundary_id_col}`) to enable the map view."
         )
     else:
-        map_df = snapshot_all.copy()
-        if "date" in map_df.columns:
-            map_df["date"] = map_df["date"].astype(str)
-        merged = gdf.merge(map_df, on="unit", how="left")
-        merged["CWB"] = merged["CWB"].astype(float)
-        merged["SPEI"] = merged["SPEI"].astype(float)
+        map_cols = ["unit", "CWB", "SPEI", "SPEI_status", "AI", "Aridity_class"]
+        map_cols = [c for c in map_cols if c in snapshot_all.columns]
+        # Left-join onto all polygons so units without data still render (grey).
+        map_df = pd.DataFrame({"unit": gdf["unit"].unique()}).merge(
+            snapshot_all[map_cols], on="unit", how="left"
+        )
+        for col in ("SPEI_status", "Aridity_class"):
+            if col in map_df.columns:
+                map_df[col] = map_df[col].fillna("No Data")
 
         map_metric = st.selectbox(
             "Map metric", ["CWB (continuous)", "SPEI (standardized)", "Aridity class"]
         )
-        merged_reset = merged.reset_index(drop=True)
-        geojson = json.loads(merged_reset.to_json())
-
-        bounds = merged_reset.total_bounds  # minx, miny, maxx, maxy
         center = {
             "lat": (bounds[1] + bounds[3]) / 2,
             "lon": (bounds[0] + bounds[2]) / 2,
         }
+        zoom = zoom_from_bounds(bounds)
+        basemap = st.radio(
+            "Map style",
+            list(MAP_ENGINES.keys()),
+            horizontal=True,
+            help="'Flat polygons' works with every Streamlit/Plotly version. The tile "
+            "maps need a recent Streamlit (Plotly.js >= 2.35) and, for basemaps, "
+            "internet access; otherwise they show an empty chart.",
+        )
 
         if map_metric == "Aridity class":
-            fig_map = px.choropleth_map(
-                merged_reset,
-                geojson=geojson,
-                locations=merged_reset.index,
+            fig_map = make_choropleth(
+                map_df,
+                geojson,
+                center,
+                zoom,
+                basemap=basemap,
                 color="Aridity_class",
                 color_discrete_map=ARIDITY_COLORS,
-                hover_name="unit",
-                hover_data={"AI": ":.2f"},
-                center=center,
-                zoom=8,
-                height=600,
-                opacity=0.85,
+                hover_data={"AI": ":.2f", "unit": False},
                 title=f"Aridity classification by {unit_label} — {status_period_label}",
             )
         elif map_metric == "SPEI (standardized)":
-            fig_map = px.choropleth_map(
-                merged_reset,
-                geojson=geojson,
-                locations=merged_reset.index,
+            fig_map = make_choropleth(
+                map_df,
+                geojson,
+                center,
+                zoom,
+                basemap=basemap,
                 color="SPEI",
                 color_continuous_scale=WATER_COLORSCALE,
                 range_color=STD_INDEX_RANGE,
-                hover_name="unit",
-                hover_data={"SPEI": ":.2f", "SPEI_status": True},
-                center=center,
-                zoom=8,
-                height=600,
-                opacity=0.85,
-                title=f"Standardized Precipitation-Evapotranspiration Index (SPEI) by {unit_label} — {status_period_label}",
+                hover_data={"SPEI": ":.2f", "SPEI_status": True, "unit": False},
+                title=f"SPEI by {unit_label} — {status_period_label}",
             )
         else:
             cwb_bound = (
-                float(np.nanmax(np.abs(merged_reset["CWB"])))
-                if merged_reset["CWB"].notna().any()
+                float(np.nanmax(np.abs(map_df["CWB"])))
+                if map_df["CWB"].notna().any()
                 else 1.0
             )
-            fig_map = px.choropleth_map(
-                merged_reset,
-                geojson=geojson,
-                locations=merged_reset.index,
+            fig_map = make_choropleth(
+                map_df,
+                geojson,
+                center,
+                zoom,
+                basemap=basemap,
                 color="CWB",
                 color_continuous_scale=WATER_COLORSCALE,
                 range_color=(-cwb_bound, cwb_bound),
-                hover_name="unit",
-                hover_data={"CWB": ":.0f", "Aridity_class": True},
-                center=center,
-                zoom=8,
-                height=600,
-                opacity=0.85,
+                hover_data={"CWB": ":.0f", "Aridity_class": True, "unit": False},
                 title=f"Climatic Water Balance (CWB, mm) by {unit_label} — {status_period_label}",
             )
-        fig_map.update_layout(
-            map_style="carto-positron", margin=dict(l=0, r=0, t=40, b=0)
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
+        st.plotly_chart(fig_map, **STRETCH)
 
-        no_geom = set(map_df["unit"]) - set(gdf["unit"])
+        no_geom = set(snapshot_all["unit"]) - set(gdf["unit"])
         if no_geom:
             st.warning(
                 "These units from the CSV data have no matching polygon in the boundary file "
                 f"(check name spelling): {', '.join(sorted(no_geom))}"
             )
 
-# ---- Trends tab ----
+# ---- Trends ----
 with tab_trends:
     fig_spei = px.line(
         indicators,
         x="date",
         y="SPEI",
         color="unit",
-        title=f"Standardized Precipitation-Evapotranspiration Index (SPEI-{spei_scale}, simplified)",
+        title=f"Standardized Precipitation-Evapotranspiration Index (SPEI-{spei_scale})",
     )
     fig_spei.add_hline(y=0, line_dash="dash", line_color="gray")
-
-    zones = [
-        (-3, -2, "#B2182B", "Extremely dry"),
-        (-2, -1.5, "#EF8A62", "Very dry"),
-        (-1.5, -1, "#FDCC8A", "Moderately dry"),
-        (-1, 1, "#E0E0E0", "Normal"),
-        (1, 1.5, "#B3CDE3", "Moderately wet"),
-        (1.5, 2, "#67A9CF", "Very wet"),
-        (2, 3, "#2166AC", "Extremely wet"),
-    ]
-
-    alpha = 0.35
-
-    for y0, y1, color, label in zones:
-        fig_spei.add_hrect(
-            y0=y0,
-            y1=y1,
-            fillcolor=color,
-            opacity=alpha,
-            line_width=0,
-        )
-
+    add_bands(fig_spei, SPEI_ZONES)
     fig_spei.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-    st.plotly_chart(fig_spei, use_container_width=True)
+    st.plotly_chart(fig_spei, **STRETCH)
 
     fig_esi = px.line(
         indicators,
@@ -770,17 +864,9 @@ with tab_trends:
         title="Evaporative Stress Index (higher = more stress)",
     )
     fig_esi.add_hline(y=0, line_dash="dash", line_color="gray")
-
-    for y0, y1, color, label in zones:
-        fig_esi.add_hrect(
-            y0=y0,
-            y1=y1,
-            fillcolor=color,
-            opacity=alpha,
-            line_width=0,
-        )
+    add_bands(fig_esi, ESI_ZONES)
     fig_esi.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-    st.plotly_chart(fig_esi, use_container_width=True)
+    st.plotly_chart(fig_esi, **STRETCH)
 
     fig_cwb = px.bar(
         indicators,
@@ -791,7 +877,7 @@ with tab_trends:
         barmode="group",
     )
     fig_cwb.add_hline(y=0, line_dash="dash", line_color="gray")
-    st.plotly_chart(fig_cwb, use_container_width=True)
+    st.plotly_chart(fig_cwb, **STRETCH)
 
     fig_twsa = px.line(
         indicators,
@@ -801,120 +887,27 @@ with tab_trends:
         title="Terrestrial Water Storage Anomaly (standardized)",
     )
     fig_twsa.add_hline(y=0, line_dash="dash", line_color="gray")
-    for y0, y1, color, label in zones:
-        fig_twsa.add_hrect(
-            y0=y0,
-            y1=y1,
-            fillcolor=color,
-            opacity=alpha,
-            line_width=0,
-        )
-
+    add_bands(fig_twsa, SPEI_ZONES)
     fig_twsa.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-    st.plotly_chart(fig_twsa, use_container_width=True)
-
-    # fig_wai = px.line(
-    #     indicators,
-    #     x="date",
-    #     y="WAI",
-    #     color="unit",
-    #     title="Composite Water Availability Index (WAI) over time",
-    # )
-    # fig_wai.add_hrect(y0=-1, y1=1, fillcolor="green", opacity=0.07, line_width=0)
-    # fig_wai.add_hrect(y0=-2, y1=-1, fillcolor="orange", opacity=0.08, line_width=0)
-    # fig_wai.add_hrect(
-    #     y0=STD_INDEX_RANGE[0], y1=-2, fillcolor="red", opacity=0.08, line_width=0
-    # )
-    # fig_wai.update_layout(
-    #     yaxis_title="WAI (standardized)", yaxis=dict(range=list(STD_INDEX_RANGE))
-    # )
-    # st.plotly_chart(fig_wai, use_container_width=True)
-
-    # c1, c2 = st.columns(2)
-    # with c1:
-    #     # fig_cwb = px.bar(
-    #     #     indicators,
-    #     #     x="date",
-    #     #     y="CWB",
-    #     #     color="unit",
-    #     #     title="Climatic Water Balance (PCP − RET, mm)",
-    #     #     barmode="group",
-    #     # )
-    #     # fig_cwb.add_hline(y=0, line_dash="dash", line_color="gray")
-    #     # st.plotly_chart(fig_cwb, use_container_width=True)
-
-    #     fig_spi = px.line(
-    #         indicators,
-    #         x="date",
-    #         y="SPI",
-    #         color="unit",
-    #         title=f"Standardized Precipitation Index (SPI-{spi_scale})",
-    #     )
-    #     fig_spi.add_hline(y=0, line_dash="dash", line_color="gray")
-    #     fig_spi.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-    #     st.plotly_chart(fig_spi, use_container_width=True)
-
-    #     fig_tws = px.line(
-    #         indicators,
-    #         x="date",
-    #         y="TWS",
-    #         color="unit",
-    #         title="Terrestrial Water Storage (raw)",
-    #     )
-    #     st.plotly_chart(fig_tws, use_container_width=True)
-
-    # with c2:
-    #     fig_esi = px.line(
-    #         indicators,
-    #         x="date",
-    #         y="ESI",
-    #         color="unit",
-    #         title="Evaporative Stress Index (higher = more stress)",
-    #     )
-    #     fig_esi.add_hline(y=0, line_dash="dash", line_color="gray")
-    #     fig_esi.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-    #     st.plotly_chart(fig_esi, use_container_width=True)
-
-    # fig_spei = px.line(
-    #     indicators,
-    #     x="date",
-    #     y="SPEI",
-    #     color="unit",
-    #     title=f"Standardized Precipitation-Evapotranspiration Index (SPEI-{spei_scale}, simplified)",
-    # )
-    # fig_spei.add_hline(y=0, line_dash="dash", line_color="gray")
-    # fig_spei.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-    # st.plotly_chart(fig_spei, use_container_width=True)
-
-    # fig_twsa = px.line(
-    #     indicators,
-    #     x="date",
-    #     y="TWSA",
-    #     color="unit",
-    #     title="Terrestrial Water Storage Anomaly (standardized)",
-    # )
-    # fig_twsa.add_hline(y=0, line_dash="dash", line_color="gray")
-    # fig_twsa.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-    # st.plotly_chart(fig_twsa, use_container_width=True)
+    st.plotly_chart(fig_twsa, **STRETCH)
 
     if annual_df is not None and not annual_df.empty and "unit" in annual_df.columns:
         st.markdown("#### Annual totals")
         adf = annual_df[annual_df["unit"].isin(selected_units)].copy()
-        metric = st.selectbox(
-            "Annual metric",
-            [c for c in ["PCP", "ET", "RET", "TWS"] if c in adf.columns],
-        )
-        fig_annual = px.bar(
-            adf.sort_values("year"),
-            x="year",
-            y=metric,
-            color="unit",
-            barmode="group",
-            title=f"Annual {metric} by {unit_label}",
-        )
-        st.plotly_chart(fig_annual, use_container_width=True)
+        metric_options = [c for c in ["PCP", "ET", "RET", "TWS"] if c in adf.columns]
+        if metric_options and not adf.empty:
+            metric = st.selectbox("Annual metric", metric_options)
+            fig_annual = px.bar(
+                adf.sort_values("year"),
+                x="year",
+                y=metric,
+                color="unit",
+                barmode="group",
+                title=f"Annual {metric} by {unit_label}",
+            )
+            st.plotly_chart(fig_annual, **STRETCH)
 
-# ---- Anomaly Analysis tab ----
+# ---- Anomaly Analysis ----
 with tab_anomaly:
     if not selected_units:
         st.info(
@@ -944,18 +937,18 @@ with tab_anomaly:
             "Nov",
             "Dec",
         ]
-
         pivot = hdf.pivot_table(
             index="Year", columns="Month", values=heat_metric, aggfunc="mean"
-        )
-        pivot = pivot.reindex(columns=month_order)
+        ).reindex(columns=month_order)
 
+        # ESI: high = stress, so flip the scale so brown still means "bad".
+        heat_scale = WATER_COLORSCALE + ("_r" if heat_metric == "ESI" else "")
         fig_heat = go.Figure(
             data=go.Heatmap(
                 z=pivot.values,
                 x=pivot.columns,
                 y=pivot.index,
-                colorscale=WATER_COLORSCALE,
+                colorscale=heat_scale,
                 zmid=0,
                 zmin=STD_INDEX_RANGE[0],
                 zmax=STD_INDEX_RANGE[1],
@@ -965,17 +958,21 @@ with tab_anomaly:
         fig_heat.update_layout(
             title=f"{heat_metric} by month/year — {unit_for_heat}", height=450
         )
-        st.plotly_chart(fig_heat, use_container_width=True)
-        st.caption(
-            "Teal/blue = wetter / higher availability, brown = drier / lower availability "
-            "(relative to that calendar month's own history)."
-        )
+        st.plotly_chart(fig_heat, **STRETCH)
+        if heat_metric == "ESI":
+            st.caption(
+                "Brown = higher evaporative stress, teal/blue = lower stress "
+                "(relative to that calendar month's own history)."
+            )
+        else:
+            st.caption(
+                "Teal/blue = wetter / higher availability, brown = drier / lower availability "
+                "(relative to that calendar month's own history)."
+            )
 
-        st.markdown("#### Cross-unit comparison, latest month (all units)")
+        st.markdown(f"#### Cross-unit comparison — {status_period_label} (all units)")
         comp_metric = st.selectbox(
-            "Comparison metric",
-            ["SPEI", "TWSA", "ESI", "CWB"],
-            key="comp_metric",
+            "Comparison metric", ["SPEI", "TWSA", "ESI", "CWB"], key="comp_metric"
         )
         fig_comp = px.bar(
             snapshot_all.sort_values(comp_metric),
@@ -988,9 +985,9 @@ with tab_anomaly:
         fig_comp.update_layout(xaxis_title=None)
         if comp_metric in ("SPEI", "TWSA", "ESI"):
             fig_comp.update_layout(yaxis=dict(range=list(STD_INDEX_RANGE)))
-        st.plotly_chart(fig_comp, use_container_width=True)
+        st.plotly_chart(fig_comp, **STRETCH)
 
-# ---- Data & Exports tab ----
+# ---- Data & Exports ----
 with tab_data:
     export_scope = st.radio(
         "Scope",
@@ -1013,18 +1010,15 @@ with tab_data:
         "CWB",
         "AI",
         "ESI",
-        # "SPI",
         "SPEI",
         "TWSA",
-        # "WAI",
-        # "WAI_status",
         "Aridity_class",
     ]
     display_cols = [c for c in display_cols if c in data_scope_df.columns]
     st.dataframe(
         data_scope_df[display_cols].sort_values(["unit", "date"]),
-        use_container_width=True,
         height=400,
+        **STRETCH,
     )
 
     csv_buf = io.StringIO()
@@ -1044,7 +1038,7 @@ with tab_data:
             if "unit" in annual_df.columns
             else annual_df
         )
-        st.dataframe(adf, use_container_width=True, height=300)
+        st.dataframe(adf, height=300, **STRETCH)
         csv_buf2 = io.StringIO()
         adf.to_csv(csv_buf2, index=False)
         st.download_button(
@@ -1059,39 +1053,35 @@ with tab_data:
         if "date" in snapshot_export.columns:
             snapshot_export["date"] = snapshot_export["date"].astype(str)
         merged_export = gdf.merge(snapshot_export, on="unit", how="left")
-        geojson_bytes = merged_export.to_json().encode("utf-8")
         st.download_button(
-            f"⬇️ Download {unit_label} boundaries + latest status (all units) as GeoJSON",
-            data=geojson_bytes,
-            file_name="units_with_latest_status.geojson",
+            f"⬇️ Download {unit_label} boundaries + status ({status_period_label}, all units) as GeoJSON",
+            data=merged_export.to_json().encode("utf-8"),
+            file_name="units_with_status.geojson",
             mime="application/geo+json",
         )
 
     with st.expander("Method notes"):
         st.markdown(
             f"""
-- **SPEI** here is a SPEI from a climatic-water-balance series using the `spei`
-  package (log-logistic/fisk fit per calendar month on the rolling CWB
-  accumulation) — this is the literature-standard SPEI method
-- **TWSA** is the standardized anomaly of terrestrial water storage per calendar month,
-  analogous to GRACE/GRACE-FO TWS anomaly products.The TWSA is downloaded fro the area of
-  interest from GLDAS.
-- **ESI** is the standardized anomaly of the evaporative fraction (ET / RET), sign-flipped
-  so that positive values indicate more evaporative stress (ET falling short of demand).
-- All standardized indices are classified using the McKee et al. (1993) SPI category
-  thresholds, and displayed on a fixed -3..3 axis/color range for cross-chart comparability.
-- **Aridity Index** follows the UNEP classification (PCP / RET).
-- Standardization is computed independently per spatial unit and per calendar month, so
-  results are comparable across basins/admin units of different climatologies.
-- All data is read automatically from `{data_root}/` (boundary/, monthly/, annual.csv) —
-  see the sidebar for the expected layout. The Spatial Map colors by **CWB** (mm), with
-  a symmetric range around zero so surplus and deficit are equally visible; the
-  boundary file's unit-name column must be `{boundary_id_col}` for {spatial_unit}.
-- The **Status basis** control in the sidebar applies to the status cards, alerts, the
-  Spatial Map, and the cross-unit comparison chart: "Latest month in period" snapshots
-  the most recent month within the selected date range (previous default behavior);
-  "Period average" averages every indicator across the whole selected range per unit
-  and reclassifies SPEI status / Aridity class from those averaged values; "Select a
-  month" lets you pin the status (and the map) to one specific month within the range.
+- **SPEI**: the climatic water balance (PCP − RET) is accumulated over the chosen window and
+  standardized per calendar month with the `spei` package (log-logistic fit; Vicente-Serrano
+  et al., 2010). If the package is unavailable or a fit fails, a per-calendar-month normal
+  standardization is used instead; the dashboard warns when that happens and the method is
+  recorded per unit in the `SPEI_method` field.
+- **TWSA**: standardized anomaly of terrestrial water storage per calendar month, analogous to
+  GRACE/GRACE-FO anomaly products. TWS is taken from GLDAS for the area of interest.
+- **ESI**: standardized anomaly of the evaporative fraction (ET / RET), sign-flipped so
+  positive values mean more evaporative stress. Its colour bands and heatmap scale are
+  therefore mirrored relative to SPEI/TWSA (brown = stress).
+- Standardized indices use the McKee et al. (1993) category thresholds and a fixed −3..3 range.
+- **Aridity Index** = PCP / RET, classified with the UNEP scheme (Humid ≥ 0.65, Dry Sub-Humid
+  ≥ 0.5, Semi-Arid ≥ 0.2, Arid ≥ 0.05, else Hyper-Arid). In *Period average* mode AI is
+  mean PCP / mean RET. Note that in single-month modes the class reflects that month only,
+  not the long-term climatology UNEP intends.
+- Standardization is computed independently per unit and calendar month.
+- Data is read from `{data_root}/` (boundary/, monthly/, annual.csv) and cached; changing
+  files on disk invalidates the cache automatically.
+- **Status basis** applies to the cards, alerts, the Spatial Map and the cross-unit
+  comparison: latest month in the range, the period average, or a pinned month.
             """
         )
