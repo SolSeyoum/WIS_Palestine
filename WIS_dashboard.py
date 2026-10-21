@@ -45,8 +45,8 @@ except ImportError:  # pragma: no cover
     _HAS_GEO = False
 
 from water_indicators import (
-    METHOD_PACKAGE,
     IndicatorConfig,
+    METHOD_PACKAGE,
     compute_all_indicators,
     latest_snapshot,
     period_average_snapshot,
@@ -302,9 +302,7 @@ def read_annual_csv(path: str, signature) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner="Computing indicators…")
-def compute_indicators_cached(
-    monthly_dir: str, signature, spei_scale: int
-) -> pd.DataFrame:
+def compute_indicators_cached(monthly_dir: str, signature, spei_scale: int) -> pd.DataFrame:
     """Load + compute once per (data on disk, SPEI window). Widget changes
     that don't touch these inputs (date range, units, map metric…) reuse it."""
     monthly = read_monthly_csvs(monthly_dir, signature)
@@ -327,14 +325,20 @@ def ensure_unit_column(df: pd.DataFrame, label: str, fallback_col: str) -> pd.Da
     return df
 
 
-def zoom_from_bounds(bounds, map_width_px=1000, map_height_px=600) -> float:
-    """Approximate web-map zoom that fits the boundary extent."""
+def zoom_from_bounds(bounds, map_width_px=1000, map_height_px=600, pad=0.05) -> float:
+    """Tightest web-map zoom (Web-Mercator, 512 px tiles) that still fits the
+    whole boundary extent in the map frame."""
     minx, miny, maxx, maxy = bounds
-    lon_span = max(maxx - minx, 1e-4)
-    lat_span = max(maxy - miny, 1e-4)
+
+    def merc_y(lat):
+        lat = max(min(lat, 85.0), -85.0)
+        return math.degrees(math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)))
+
+    lon_span = max(maxx - minx, 1e-6)
+    lat_span = max(merc_y(maxy) - merc_y(miny), 1e-6)
     lon_zoom = math.log2(360 * (map_width_px / 512) / lon_span)
-    lat_zoom = math.log2(180 * (map_height_px / 512) / lat_span)
-    return float(min(max(min(lon_zoom, lat_zoom) - 0.3, 0.5), 14))
+    lat_zoom = math.log2(360 * (map_height_px / 512) / lat_span)
+    return float(min(max(min(lon_zoom, lat_zoom) - pad, 0.5), 18))
 
 
 MAP_ENGINES = {
@@ -521,9 +525,7 @@ if not _HAS_GEO:
         "`pip install geopandas shapely` to enable boundary loading and the map view."
     )
 
-spatial_unit = st.sidebar.radio(
-    "Spatial unit", ["River Basins", "Administrative Units"]
-)
+spatial_unit = st.sidebar.radio("Spatial unit", ["River Basins", "Administrative Units"])
 unit_label = "basin" if spatial_unit == "River Basins" else "administrative unit"
 
 data_root = os.path.join(
@@ -554,9 +556,7 @@ monthly_df = read_monthly_csvs(monthly_dir, monthly_sig)
 annual_df = None
 if os.path.isfile(annual_path):
     annual_df = read_annual_csv(annual_path, folder_signature(annual_path))
-    annual_df = ensure_unit_column(
-        annual_df, "annual.csv", fallback_col=boundary_id_col
-    )
+    annual_df = ensure_unit_column(annual_df, "annual.csv", fallback_col=boundary_id_col)
     if "unit" in annual_df.columns:
         annual_df = annual_df.copy()
         annual_df["unit"] = annual_df["unit"].astype(str).str.strip()
@@ -700,7 +700,9 @@ if status_mode == "Period average":
     if period_start.strftime("%b %Y") == period_end.strftime("%b %Y"):
         status_period_label = f"average, {period_start.strftime('%B %Y')}"
     else:
-        status_period_label = f"average, {period_start.strftime('%b %Y')} – {period_end.strftime('%b %Y')}"
+        status_period_label = (
+            f"average, {period_start.strftime('%b %Y')} – {period_end.strftime('%b %Y')}"
+        )
 elif status_mode == "Select a month":
     snapshot_all = indicators_all[indicators_all["date"] == selected_month_ts].copy()
     status_period_label = pd.Timestamp(selected_month_ts).strftime("%B %Y")
@@ -733,9 +735,7 @@ else:
             cwb_txt = f"{row['CWB']:.0f} mm" if pd.notna(row["CWB"]) else "n/a"
             st.caption(f"CWB {cwb_txt} · Aridity: {row['Aridity_class']}")
 
-alert_rows = snapshot_all[
-    snapshot_all["SPEI_status"].isin(["Severely Dry", "Extremely Dry"])
-]
+alert_rows = snapshot_all[snapshot_all["SPEI_status"].isin(["Severely Dry", "Extremely Dry"])]
 if not alert_rows.empty:
     names = alert_rows["unit"].tolist()
     st.error(
@@ -784,6 +784,7 @@ with tab_map:
         basemap = st.radio(
             "Map style",
             list(MAP_ENGINES.keys()),
+            index=list(MAP_ENGINES.values()).index("carto-positron"),
             horizontal=True,
             help="'Flat polygons' works with every Streamlit/Plotly version. The tile "
             "maps need a recent Streamlit (Plotly.js >= 2.35) and, for basemaps, "
@@ -910,9 +911,7 @@ with tab_trends:
 # ---- Anomaly Analysis ----
 with tab_anomaly:
     if not selected_units:
-        st.info(
-            f"Select at least one {unit_label} in the sidebar to see anomaly analysis."
-        )
+        st.info(f"Select at least one {unit_label} in the sidebar to see anomaly analysis.")
     else:
         c1, c2 = st.columns(2)
         with c1:
@@ -924,18 +923,8 @@ with tab_anomaly:
         hdf["Year"] = hdf["date"].dt.year
         hdf["Month"] = hdf["date"].dt.strftime("%b")
         month_order = [
-            "Jan",
-            "Feb",
-            "Mar",
-            "Apr",
-            "May",
-            "Jun",
-            "Jul",
-            "Aug",
-            "Sep",
-            "Oct",
-            "Nov",
-            "Dec",
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
         ]
         pivot = hdf.pivot_table(
             index="Year", columns="Month", values=heat_metric, aggfunc="mean"
@@ -1001,18 +990,8 @@ with tab_data:
 
     st.markdown("**Computed monthly indicators**")
     display_cols = [
-        "date",
-        "unit",
-        "PCP",
-        "ET",
-        "RET",
-        "TWS",
-        "CWB",
-        "AI",
-        "ESI",
-        "SPEI",
-        "TWSA",
-        "Aridity_class",
+        "date", "unit", "PCP", "ET", "RET", "TWS", "CWB", "AI",
+        "ESI", "SPEI", "TWSA", "Aridity_class",
     ]
     display_cols = [c for c in display_cols if c in data_scope_df.columns]
     st.dataframe(
