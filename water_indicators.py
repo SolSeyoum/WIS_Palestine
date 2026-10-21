@@ -1,37 +1,35 @@
 """
 water_indicators.py
 ====================
-Computation of climate / water-balance / hydrological-stress indicators for
-the Climate-Water Balance Dashboard.
+Climate / water-balance / hydrological-stress indicators for the
+Climate-Water Balance Dashboard.
 
-Works on a long-format monthly time series with one row per
-(spatial unit, date) and columns:
+Input: a long-format monthly time series, one row per (unit, date):
 
-    unit  - basin or administrative-unit name (grouping key, optional)
+    unit  - basin or administrative-unit name (grouping key)
     date  - monthly timestamp
     PCP   - precipitation (mm)
     ET    - actual evapotranspiration (mm)          [AETI in source CSVs]
     RET   - reference / potential evapotranspiration (mm)
-    TWS   - terrestrial water storage (consistent unit, e.g. mm or cm eq.)
+    TWS   - terrestrial water storage (consistent unit)
 
-Indicators produced:
-    CWB    - Climatic Water Balance = PCP - RET (mm)
-    AI     - Aridity Index (UNEP) = PCP / RET
-    ESI    - Evaporative Stress Index: standardized anomaly of -(ET/RET);
-             positive = more evaporative stress
-    SPEI   - Standardized Precipitation-Evapotranspiration Index, computed
-             with the `spei` package (Vonk, 2025): the climatic water
-             balance (CWB = PCP - RET) is accumulated over `spei_scale`
-             months and standardized by fitting a log-logistic (fisk)
-             distribution per calendar month — the distribution recommended
-             in the original SPEI literature (Vicente-Serrano et al., 2010).
-             Falls back to a simplified per-calendar-month normal-fit
-             standardization if the `spei` package isn't installed or the
-             distribution fit fails (e.g. very short/degenerate records).
-    TWSA   - standardized anomaly of TWS, per calendar month (GRACE-style
-             terrestrial water storage anomaly)
+Indicators:
+    CWB   - Climatic Water Balance = PCP - RET (mm)
+    AI    - Aridity Index (UNEP) = PCP / RET
+    ESI   - Evaporative Stress Index: standardized anomaly of -(ET/RET);
+            positive = more evaporative stress
+    SPEI  - Standardized Precipitation-Evapotranspiration Index. CWB is
+            accumulated over `spei_scale` months and standardized with the
+            `spei` package (log-logistic fit per calendar month; Vicente-
+            Serrano et al., 2010). If the package is missing or a fit fails,
+            a per-calendar-month normal standardization is used instead and
+            the `SPEI_method` column records which method produced the values.
+    TWSA  - standardized anomaly of TWS, per calendar month
 
-    SPEI_status, Aridity_class - categorical labels for display
+    SPEI_status, Aridity_class - categorical labels for display.
+
+This module is the single source of truth for classification thresholds
+(aridity, SPEI) and for the period-average snapshot.
 """
 
 from dataclasses import dataclass
@@ -40,101 +38,71 @@ import numpy as np
 import pandas as pd
 
 try:
-    from scipy import stats
-
-    _HAS_SCIPY = True
-except ImportError:  # pragma: no cover
-    _HAS_SCIPY = False
-
-try:
     import spei as spei_pkg
 
     _HAS_SPEI_PKG = True
 except ImportError:  # pragma: no cover
     _HAS_SPEI_PKG = False
 
-# DEFAULT_WEIGHTS = {"SPI": 0.3, "SPEI": 0.3, "ESI": 0.2, "TWSA": 0.2}
-
 REQUIRED_COLUMNS = ["date", "PCP", "ET", "RET", "TWS"]
 
-# Ordered high -> low. classify_wai walks this list and returns the first
-# label whose threshold the value meets or exceeds.
-WAI_THRESHOLDS = [
-    (2.0, "Extremely Wet / Surplus"),
-    (1.5, "Very Wet / High Availability"),
-    (1.0, "Moderately Wet / Good Availability"),
-    (-1.0, "Near Normal"),
-    (-1.5, "Moderately Dry / Watch"),
-    (-2.0, "Severely Dry / Alert"),
-    (-np.inf, "Extremely Dry / Critical"),
-]
+METHOD_PACKAGE = "log-logistic (spei package)"
+METHOD_FALLBACK = "normal fallback"
+METHOD_MIXED = "mixed (partial normal fallback)"
 
-SPEI_THRESHOLDS = {
-    "Extremely Wet": 2.0,  # SPEI > 2
-    "Very Wet": 1.5,  # 1.5 < SPEI <= 2
-    "Moderately Wet": 1.0,  # 1 < SPEI <= 1.5
-    "Near Normal": -1.0,  # -1 <= SPEI <= 1
-    "Moderately Dry": -1.5,  # -1.5 <= SPEI < -1
-    "Severely Dry": -2.0,  # -2 <= SPEI < -1.5
-    # anything below -2 -> "Extremely Dry / Critical"
-}
+# Ordered high -> low; first threshold the value meets or exceeds wins.
+SPEI_THRESHOLDS = [
+    (2.0, "Extremely Wet", False),  # SPEI > 2
+    (1.5, "Very Wet", False),  # 1.5 < SPEI <= 2
+    (1.0, "Moderately Wet", False),  # 1 < SPEI <= 1.5
+    (-1.0, "Near Normal", True),  # -1 <= SPEI <= 1
+    (-1.5, "Moderately Dry", True),  # -1.5 <= SPEI < -1
+    (-2.0, "Severely Dry", True),  # -2 <= SPEI < -1.5
+]  # anything below -2 -> "Extremely Dry"
 
+# UNEP aridity classes (PCP / RET). Humid starts at 0.65.
 ARIDITY_THRESHOLDS = [
-    (0.75, "Humid"),
+    (0.65, "Humid"),
     (0.5, "Dry Sub-Humid"),
     (0.2, "Semi-Arid"),
     (0.05, "Arid"),
-    (-np.inf, "Hyper-Arid"),
-]
+]  # below 0.05 -> "Hyper-Arid"
 
 
 @dataclass
 class IndicatorConfig:
-    spi_scale: int = 3
     spei_scale: int = 3
     twsa_scale: int = 1
-    # weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
 
 
-def classify_wai(value) -> str:
+# --------------------------------------------------------------------------
+# Classification
+# --------------------------------------------------------------------------
+
+
+def classify_spei(value) -> str:
+    """Classify a SPEI value (McKee et al. 1993 style categories)."""
     if pd.isna(value):
         return "No Data"
-    for threshold, label in WAI_THRESHOLDS:
-        if value >= threshold:
+    for threshold, label, inclusive in SPEI_THRESHOLDS:
+        if value > threshold or (inclusive and value == threshold):
             return label
-    return "Extremely Dry / Critical"
-
-
-def classify_spei(value: float) -> str:
-    """Classify a SPEI value into a water-availability status category
-    using SPEI_THRESHOLDS: |SPEI| <= 1 Near Normal; 1-1.5 / -1 to -1.5
-    Moderately Wet/Dry; 1.5-2 / -1.5 to -2 Very Wet/Dry; beyond +/-2
-    Extremely Wet/Dry."""
-    if pd.isna(value):
-        return "No Data"
-    if value > SPEI_THRESHOLDS["Extremely Wet"]:
-        return "Extremely Wet"
-    elif value > SPEI_THRESHOLDS["Very Wet"]:
-        return "Very Wet"
-    elif value > SPEI_THRESHOLDS["Moderately Wet"]:
-        return "Moderately Wet"
-    elif value >= SPEI_THRESHOLDS["Near Normal"]:
-        return "Near Normal"
-    elif value >= SPEI_THRESHOLDS["Moderately Dry"]:
-        return "Moderately Dry"
-    elif value >= SPEI_THRESHOLDS["Severely Dry"]:
-        return "Severely Dry"
-    else:
-        return "Extremely Dry"
+    return "Extremely Dry"
 
 
 def classify_aridity(ai) -> str:
+    """UNEP aridity class from the Aridity Index (PCP / RET)."""
     if pd.isna(ai):
         return "No Data"
     for threshold, label in ARIDITY_THRESHOLDS:
         if ai >= threshold:
             return label
     return "Hyper-Arid"
+
+
+# --------------------------------------------------------------------------
+# Standardization helpers
+# --------------------------------------------------------------------------
 
 
 def _rolling_accum(s: pd.Series, scale: int) -> pd.Series:
@@ -144,14 +112,12 @@ def _rolling_accum(s: pd.Series, scale: int) -> pd.Series:
 
 
 def _normal_standardize_by_month(values: pd.Series, months: pd.Series) -> pd.Series:
-    """Per-calendar-month z-score standardization (mean/stdev of that
-    calendar month's own history)."""
+    """Per-calendar-month z-score (mean/std of that month's own history)."""
     df = pd.DataFrame({"v": values.values, "m": months.values}, index=values.index)
-    out = pd.Series(index=values.index, dtype=float)
+    out = pd.Series(np.nan, index=values.index, dtype=float)
     for _, grp in df.groupby("m"):
         valid = grp["v"].dropna()
         if len(valid) < 3:
-            out.loc[grp.index] = np.nan
             continue
         mu, sigma = valid.mean(), valid.std(ddof=0)
         if sigma == 0 or np.isnan(sigma):
@@ -161,86 +127,37 @@ def _normal_standardize_by_month(values: pd.Series, months: pd.Series) -> pd.Ser
     return out
 
 
-def _gamma_standardize_by_month(values: pd.Series, months: pd.Series) -> pd.Series:
-    """
-    Zero-inflated gamma standardization per calendar month (the standard
-    operational SPI method). Falls back to a per-month normal-score
-    transform when scipy is unavailable or a fit fails (too few points,
-    degenerate/negative data, etc.) - this keeps the dashboard usable on
-    short or sparse basin records.
-    """
-    fallback = _normal_standardize_by_month(values, months)
-    if not _HAS_SCIPY:
-        return fallback
+def _spei_via_package(cwb: pd.Series, dates: pd.Series, timescale: int):
+    """SPEI from a CWB series using the `spei` package.
 
-    df = pd.DataFrame({"v": values.values, "m": months.values}, index=values.index)
-    out = pd.Series(index=values.index, dtype=float)
-    for _, grp in df.groupby("m"):
-        valid = grp["v"].dropna()
-        if len(valid) < 6:
-            out.loc[grp.index] = fallback.loc[grp.index]
-            continue
-        zeros = int((valid <= 0).sum())
-        p0 = zeros / len(valid)
-        positive = valid[valid > 0]
-        if len(positive) < 5 or positive.std() == 0:
-            out.loc[grp.index] = fallback.loc[grp.index]
-            continue
-        try:
-            shape, _loc, scale = stats.gamma.fit(positive, floc=0)
-            v = grp["v"].values
-            cdf = np.where(
-                v > 0,
-                p0
-                + (1 - p0)
-                * stats.gamma.cdf(np.clip(v, 1e-9, None), shape, loc=0, scale=scale),
-                p0 / 2.0,
-            )
-            cdf = np.clip(cdf, 1e-6, 1 - 1e-6)
-            out.loc[grp.index] = stats.norm.ppf(cdf)
-        except Exception:
-            out.loc[grp.index] = fallback.loc[grp.index]
-    return out
-
-
-def _spei_via_package(cwb: pd.Series, dates: pd.Series, timescale: int) -> pd.Series:
-    """Compute SPEI from a climatic-water-balance series using the `spei`
-    package (log-logistic/fisk fit per calendar month on the rolling CWB
-    accumulation) — this is the literature-standard SPEI method, not the
-    simplified normal-fit approximation.
-
-    `timescale` is the accumulation window in months (0/1 = no
-    accumulation). Falls back to the simplified per-calendar-month normal
-    standardization (on a manually rolled CWB sum) if the `spei` package
-    isn't installed or the distribution fit fails outright (e.g. too few
-    points, degenerate/constant series).
-
-    Returns a Series aligned to the original `dates`/index, with NaN for
-    any leading periods the package couldn't compute (the first
-    `timescale - 1` months of each unit's record).
+    Returns (values, method). Values the package cannot produce fall back to
+    the normal standardization of the rolled CWB; the method label reports
+    whether the fallback was used for none, some, or all values.
     """
     months = dates.dt.month
     fallback = _normal_standardize_by_month(_rolling_accum(cwb, timescale), months)
 
     if not _HAS_SPEI_PKG:
-        return fallback
+        return fallback, METHOD_FALLBACK
 
     series = pd.Series(cwb.values, index=pd.DatetimeIndex(dates.values))
     try:
         result = spei_pkg.spei(series, timescale=timescale)
     except Exception:
-        return fallback
+        return fallback, METHOD_FALLBACK
 
-    # The package drops the first (timescale - 1) periods rather than
-    # returning NaN for them, so reindex back onto the full date range.
+    # The package drops the first (timescale - 1) periods; reindex them back.
     result = result.reindex(series.index)
-    out = pd.Series(result.values, index=cwb.index)
-    # Any values the fit couldn't produce (non-finite) fall back to the
-    # simplified normal standardization rather than being left as NaN.
+    out = pd.Series(result.values, index=cwb.index, dtype=float)
     bad = ~np.isfinite(out)
-    if bad.any():
-        out.loc[bad] = fallback.loc[bad]
-    return out
+    replaced = bad & fallback.notna()
+    out.loc[bad] = fallback.loc[bad]
+    return out, (METHOD_MIXED if replaced.any() else METHOD_PACKAGE)
+
+
+# --------------------------------------------------------------------------
+# Indicator computation
+# --------------------------------------------------------------------------
 
 
 def _compute_unit(g: pd.DataFrame, config: IndicatorConfig) -> pd.DataFrame:
@@ -252,26 +169,22 @@ def _compute_unit(g: pd.DataFrame, config: IndicatorConfig) -> pd.DataFrame:
     g["Aridity_class"] = g["AI"].apply(classify_aridity)
 
     evap_fraction = g["ET"] / g["RET"].replace(0, np.nan)
-    ef_anom = _normal_standardize_by_month(evap_fraction, month)
-    g["ESI"] = -ef_anom  # positive = more evaporative stress (ET falling short of RET)
+    g["ESI"] = -_normal_standardize_by_month(evap_fraction, month)
 
-    pcp_accum = _rolling_accum(g["PCP"], config.spi_scale)
-    # g["SPI"] = _gamma_standardize_by_month(pcp_accum, month)
-
-    g["SPEI"] = _spei_via_package(g["CWB"], g["date"], config.spei_scale)
+    g["SPEI"], method = _spei_via_package(g["CWB"], g["date"], config.spei_scale)
+    g["SPEI_method"] = method
+    g["SPEI_status"] = g["SPEI"].apply(classify_spei)
 
     tws_accum = _rolling_accum(g["TWS"], config.twsa_scale)
     g["TWSA"] = _normal_standardize_by_month(tws_accum, month)
-
-    g["SPEI_status"] = g["SPEI"].apply(classify_spei)
     return g
 
 
 def compute_all_indicators(
     df: pd.DataFrame, unit_col=None, config: IndicatorConfig = None
 ) -> pd.DataFrame:
-    """Compute all indicators, grouped by `unit_col` if given (recommended -
-    calendar-month standardization is done independently per group)."""
+    """Compute all indicators, grouped by `unit_col` if given (standardization
+    is done independently per unit and calendar month)."""
     config = config or IndicatorConfig()
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
@@ -284,10 +197,13 @@ def compute_all_indicators(
 
     if unit_col and unit_col in work.columns:
         pieces = [_compute_unit(g, config) for _, g in work.groupby(unit_col)]
-        out = pd.concat(pieces, ignore_index=True)
-    else:
-        out = _compute_unit(work, config)
-    return out
+        return pd.concat(pieces, ignore_index=True)
+    return _compute_unit(work, config)
+
+
+# --------------------------------------------------------------------------
+# Snapshots
+# --------------------------------------------------------------------------
 
 
 def latest_snapshot(df: pd.DataFrame, location_col=None) -> pd.DataFrame:
@@ -297,3 +213,29 @@ def latest_snapshot(df: pd.DataFrame, location_col=None) -> pd.DataFrame:
         return df.loc[idx].reset_index(drop=True)
     latest_date = df["date"].max()
     return df[df["date"] == latest_date].reset_index(drop=True)
+
+
+def period_average_snapshot(df: pd.DataFrame, location_col: str = "unit") -> pd.DataFrame:
+    """Average indicators over the (already date-filtered) period per unit.
+
+    AI is recomputed as mean PCP / mean RET (not the mean of monthly ratios),
+    and the SPEI / aridity labels are re-derived from the averaged values.
+    """
+    cols = [
+        c
+        for c in ["PCP", "ET", "RET", "TWS", "CWB", "ESI", "SPEI", "TWSA"]
+        if c in df.columns
+    ]
+    agg = df.groupby(location_col, as_index=False)[cols].mean(numeric_only=True)
+
+    if {"PCP", "RET"} <= set(agg.columns):
+        agg["AI"] = agg["PCP"] / agg["RET"].replace(0, np.nan)
+    else:
+        agg["AI"] = np.nan
+    agg["Aridity_class"] = agg["AI"].apply(classify_aridity)
+    agg["SPEI_status"] = (
+        agg["SPEI"].apply(classify_spei) if "SPEI" in agg.columns else "No Data"
+    )
+    # Period end, kept so downstream display/export code can read a date.
+    agg["date"] = df["date"].max() if "date" in df.columns and not df.empty else pd.NaT
+    return agg
